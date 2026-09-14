@@ -313,6 +313,92 @@ def test_encoder_swap(ctx, h, w, steps):
     return f"дрейф {d['mean']} = шумовой пол {floor['mean']}"
 
 
+@step(11, "конвертер чекпоинтов ComfyUI",
+      "Маппинг имён разошёлся с текущим diffusers — смотри krea2_studio/checkpoint.py")
+def test_checkpoint_mapping(ctx, h, w, steps):
+    """Самопроверка маппинга: синтетический ComfyUI-словарь -> имена diffusers.
+
+    Не требует ни файла, ни GPU — ловит расхождение имён до того, как ты скачаешь
+    двадцать гигабайт файнтюна. Если задан KREA2_TRANSFORMER, дополнительно
+    проверяется, что реальный файл грузится и даёт картинку.
+    """
+    import os
+    import torch
+    from krea2_studio.checkpoint import convert_comfy_state_dict, infer_config
+
+    L, F_, HD, H, KV, TXT, TAPS, TDIM, INTER, PATCH, CH = 2, 64, 16, 4, 2, 32, 12, 8, 128, 2, 4
+
+    def blk(prefix, dim):
+        d = {f"{prefix}.prenorm.scale": torch.zeros(dim),
+             f"{prefix}.postnorm.scale": torch.zeros(dim),
+             f"{prefix}.attn.wq.weight": torch.zeros(HD * H, dim),
+             f"{prefix}.attn.wk.weight": torch.zeros(HD * KV, dim),
+             f"{prefix}.attn.wv.weight": torch.zeros(HD * KV, dim),
+             f"{prefix}.attn.gate.weight": torch.zeros(dim, dim),
+             f"{prefix}.attn.qknorm.qnorm.scale": torch.zeros(HD),
+             f"{prefix}.attn.qknorm.knorm.scale": torch.zeros(HD),
+             f"{prefix}.attn.wo.weight": torch.zeros(dim, dim)}
+        for name, shape in [("gate", (INTER, dim)), ("up", (INTER, dim)), ("down", (dim, INTER))]:
+            d[f"{prefix}.mlp.{name}.weight"] = torch.zeros(*shape)
+        return d
+
+    comfy = {
+        "first.weight": torch.zeros(F_, CH * PATCH * PATCH), "first.bias": torch.zeros(F_),
+        "tmlp.0.weight": torch.zeros(F_, TDIM), "tmlp.0.bias": torch.zeros(F_),
+        "tmlp.2.weight": torch.zeros(F_, F_), "tmlp.2.bias": torch.zeros(F_),
+        "tproj.1.weight": torch.zeros(F_ * 6, F_), "tproj.1.bias": torch.zeros(F_ * 6),
+        "txtmlp.0.scale": torch.zeros(TXT),
+        "txtmlp.1.weight": torch.zeros(F_, TXT), "txtmlp.1.bias": torch.zeros(F_),
+        "txtmlp.3.weight": torch.zeros(F_, F_), "txtmlp.3.bias": torch.zeros(F_),
+        "txtfusion.projector.weight": torch.zeros(1, TAPS),
+        "last.norm.scale": torch.zeros(F_),
+        "last.linear.weight": torch.zeros(PATCH * PATCH * CH, F_),
+        "last.linear.bias": torch.zeros(PATCH * PATCH * CH),
+        "last.modulation.lin": torch.zeros(2, F_),
+    }
+    for i in range(L):
+        comfy.update(blk(f"blocks.{i}", F_))
+        comfy[f"blocks.{i}.mod.lin"] = torch.zeros(6 * F_)
+    for grp in ("layerwise_blocks", "refiner_blocks"):
+        for i in range(2):
+            comfy.update(blk(f"txtfusion.{grp}.{i}", TXT))
+
+    out = convert_comfy_state_dict(comfy, strict=True)
+    assert len(out) == len(comfy), f"потеряно {len(comfy) - len(out)} тензоров"
+    assert tuple(out["transformer_blocks.0.scale_shift_table"].shape) == (6, F_)
+    assert tuple(out["final_layer.scale_shift_table"].shape) == (2, F_)
+
+    cfg = infer_config(out)
+    assert cfg["num_layers"] == L and cfg["num_attention_heads"] == H, cfg
+
+    # Сверяем с тем, что РЕАЛЬНО ждёт текущий diffusers, а не с нашим списком.
+    from diffusers import Krea2Transformer2DModel
+    expected = set(Krea2Transformer2DModel(**cfg).state_dict())
+    got = set(out)
+    if got != expected:
+        raise AssertionError(
+            f"имена разошлись с diffusers: лишних {len(got - expected)}, "
+            f"не хватает {len(expected - got)}\n"
+            f"  лишние: {sorted(got - expected)[:6]}\n"
+            f"  нет:    {sorted(expected - got)[:6]}")
+    print(f"  маппинг сошёлся: {len(out)} тензоров, имена совпали с diffusers")
+
+    path = os.environ.get("KREA2_TRANSFORMER", "")
+    if not path:
+        return "синтетика OK (KREA2_TRANSFORMER не задан — реальный файл не проверялся)"
+
+    from krea2_studio.checkpoint import guess_distilled
+    print(f"  проверяю реальный файл: {path} (distilled по имени: {guess_distilled(path)})")
+    pipe = ctx["pipe"]
+    g = torch.Generator("cuda" if torch.cuda.is_available() else "cpu").manual_seed(0)
+    img = pipe(prompt="a red fox in the snow, photo", height=h, width=w,
+               num_inference_steps=steps,
+               guidance_scale=0.0 if pipe.config.is_distilled else 4.5,
+               generator=g).images[0]
+    img.save(OUT / "11_custom_checkpoint.png")
+    return f"файл загружен -> {OUT/'11_custom_checkpoint.png'}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--height", type=int, default=864)
@@ -337,6 +423,7 @@ def main():
         (8, test_lora_effect, (h, w, s)),
         (9, test_auto_pose, (h, w, s)),
         (10, test_encoder_swap, (h, w, s)),
+        (11, test_checkpoint_mapping, (h, w, s)),
     ]
 
     print(f"разрешение {h}x{w}, шагов {s}")

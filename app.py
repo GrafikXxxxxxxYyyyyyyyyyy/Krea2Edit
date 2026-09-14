@@ -23,6 +23,12 @@ PROCESSOR_ID = os.environ.get("KREA2_PROCESSOR", "Qwen/Qwen3-VL-4B-Instruct")
 # Сменный текстовый энкодер: любой дериватив Qwen3-VL-4B (см. krea2_studio/encoder.py).
 # Пусто — берём тот, что лежит в репозитории модели.
 ENCODER_ID = os.environ.get("KREA2_TEXT_ENCODER", "")
+# Свой чекпоинт трансформера: путь к одиночному .safetensors в раскладке ComfyUI
+# (файнтюны с CivitAI). Остальные компоненты берутся из KREA2_MODEL.
+TRANSFORMER_FILE = os.environ.get("KREA2_TRANSFORMER", "")
+# Дистиллированный ли чекпоинт: от этого зависят расписание и дефолты шагов.
+# Пусто — угадываем по имени файла, "1"/"0" — задать явно.
+DISTILLED_ENV = os.environ.get("KREA2_DISTILLED", "")
 DTYPE = torch.bfloat16
 
 _pipe = None
@@ -38,6 +44,11 @@ def get_pipe():
         from transformers import AutoProcessor
 
         extra = {}
+        if TRANSFORMER_FILE:
+            from krea2_studio import guess_distilled, load_transformer
+            print(f"трансформер: {TRANSFORMER_FILE} (вместо штатного)")
+            extra["transformer"] = load_transformer(TRANSFORMER_FILE, dtype=DTYPE)
+
         if ENCODER_ID:
             from krea2_studio import check_compat, load_text_encoder
             print(f"текстовый энкодер: {ENCODER_ID} (вместо штатного)")
@@ -48,6 +59,22 @@ def get_pipe():
             # Форму проверяем до первой генерации, а не посреди денойз-лупа.
             check_compat(_pipe.text_encoder, _pipe.transformer,
                          _pipe.text_encoder_select_layers)
+        if TRANSFORMER_FILE:
+            # is_distilled определяет сдвиг расписания (mu) и дефолты шагов/guidance.
+            # Ошибиться тут дороже, чем спросить: Turbo на расписании Raw даёт мыло.
+            if DISTILLED_ENV:
+                distilled = DISTILLED_ENV == "1"
+                src = "KREA2_DISTILLED"
+            else:
+                guessed = guess_distilled(TRANSFORMER_FILE)
+                distilled = _pipe.config.is_distilled if guessed is None else guessed
+                src = "имя файла" if guessed is not None else "репозиторий KREA2_MODEL"
+                if guessed is None:
+                    print("ВНИМАНИЕ: по имени файла не понять, дистиллированный ли чекпоинт.\n"
+                          "  Если результат мыльный или пережжённый — задай KREA2_DISTILLED=1 или 0.")
+            _pipe.register_to_config(is_distilled=distilled)
+            print(f"is_distilled={distilled} (источник: {src})")
+
         _pipe.to("cuda" if torch.cuda.is_available() else "cpu")
         # Экономия VRAM: пригодится на картах меньше 40 ГБ.
         if os.environ.get("KREA2_OFFLOAD", "0") == "1":
