@@ -7,3 +7,5 @@ venv/
 
 smoke_out/
 .gradio/
+checkpoint_header.json
+smoke_out/
