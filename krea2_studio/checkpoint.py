@@ -184,7 +184,19 @@ def infer_config(sd: dict[str, torch.Tensor]) -> dict:
     kv = sd["transformer_blocks.0.attn.to_k.weight"].shape[0]
     head_dim = sd["transformer_blocks.0.attn.norm_q.weight"].shape[0]
 
+    # RoPE-оси из весов не выводятся (у них нет параметров), но модель требует
+    # sum(axes_dims_rope) == attention_head_dim и падает на несовпадении. Для штатного
+    # head_dim=128 это (32, 48, 48); для другой ширины делим в той же пропорции 1:1.5:1.5.
+    if head_dim == 128:
+        axes = (32, 48, 48)
+    else:
+        t = head_dim // 4
+        h_ = (head_dim - t) // 2
+        axes = (t, h_, head_dim - t - h_)
+        print(f"[checkpoint] нештатный head_dim={head_dim}: axes_dims_rope={axes}")
+
     return dict(
+        axes_dims_rope=axes,
         in_channels=in_ch,
         num_layers=n_layers,
         attention_head_dim=head_dim,
