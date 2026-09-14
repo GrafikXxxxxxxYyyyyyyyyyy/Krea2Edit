@@ -64,11 +64,12 @@ def check_env(ctx):
     return "Krea2Pipeline доступен"
 
 
-@step(1, "Загрузка модели", "401 -> прими условия на странице модели и задай HF_TOKEN. "
-                            "OOM -> KREA2_OFFLOAD=1")
+@step(1, "Загрузка модели и edit-LoRA",
+      "401 -> прими условия на странице модели и задай HF_TOKEN. OOM -> KREA2_OFFLOAD=1. "
+      "Если не встала LoRA -> pip install peft")
 def load_model(ctx):
     import torch
-    from krea2_studio import Krea2EditPipeline
+    from krea2_studio import Krea2EditPipeline, load_edit_lora
     from transformers import AutoProcessor
 
     model_id = os.environ.get("KREA2_MODEL", "krea/Krea-2-Turbo")
@@ -88,9 +89,19 @@ def load_model(ctx):
     n = sum(p.numel() for p in pipe.transformer.parameters())
     print(f"  трансформер: {n/1e9:.2f}B параметров (оценка в ноутбуке 07 была 12.16B)")
     print(f"  is_distilled: {pipe.config.is_distilled}")
+
+    # Без edit-LoRA шаги 3-8 отработают, но редактированием это не будет:
+    # базовые веса скопируют референс и проигнорируют инструкцию.
+    ctx["lora"] = None
+    if os.environ.get("KREA2_EDIT_LORA", "").lower() == "off":
+        print("  edit-LoRA: пропущена (KREA2_EDIT_LORA=off)")
+    else:
+        ctx["lora"] = load_edit_lora(pipe)
+        print(f"  edit-LoRA: {ctx['lora']}")
+
     if torch.cuda.is_available():
         print(f"  занято VRAM: {torch.cuda.memory_allocated()/1024**3:.1f} ГБ")
-    return f"{n/1e9:.2f}B"
+    return f"{n/1e9:.2f}B" + ("" if ctx["lora"] else ", без LoRA")
 
 
 @step(2, "t2i — базовая проверка", "Если сломан t2i, edit отлаживать бессмысленно: "
@@ -147,9 +158,9 @@ def test_ref_matters(ctx, h, w, steps):
     return f"разница {diff:.1f}"
 
 
-@step(5, "grounded encode + ОТКРЫТЫЙ ВОПРОС про vision-токены",
+@step(5, "grounded encode (vision-токены в условии)",
       "Если падает в text_encoder — Qwen3VLModel ждёт других аргументов; "
-      "смотри сигнатуру forward у своей версии transformers")
+      "смотри сигнатуру forward у своей версии transformers (с 5.x нужен mm_token_type_ids)")
 def test_grounding(ctx, h, w, steps):
     import torch
     from krea2_studio.grounding import encode_grounded
@@ -159,7 +170,7 @@ def test_grounding(ctx, h, w, steps):
                                 ctx["processor"], grounding_px=768)
     n = emb.shape[1]
     print(f"  длина условия: {n} токенов")
-    print(f"  ~350 -> vision-токены В условии (наша реализация, ноутбук 04)")
+    print(f"  ~350 -> vision-токены В условии (так и должно быть)")
     print(f"  ~13  -> они отброшены, нужно менять prefix_len")
     ctx["grounded_len"] = n
 
@@ -200,6 +211,108 @@ def test_geometry(ctx, h, w, steps):
     return f"-> {OUT}/06_geom_crop.png, 06_geom_fit.png"
 
 
+@step(8, "edit-LoRA доезжает до forward",
+      "Если разницы нет — адаптер не включился: проверь pip install peft и что "
+      "load_edit_lora отработал на шаге 1")
+def test_lora_effect(ctx, h, w, steps):
+    import torch
+    import numpy as np
+    pipe = ctx["pipe"]
+    if not ctx.get("lora"):
+        raise RuntimeError("edit-LoRA не загружена (шаг 1) — сравнивать не с чем")
+
+    # lora_scale=0 обнуляет вклад адаптера, всё остальное в проходе идентично:
+    # любая разница в результате — это ровно LoRA.
+    outs = {}
+    for tag, scale in [("off", 0.0), ("on", 1.0)]:
+        g = torch.Generator("cuda" if torch.cuda.is_available() else "cpu").manual_seed(0)
+        out = pipe.edit(prompt="turn the fox into a blue fox", images=[ctx["ref_image"]],
+                        height=h, width=w, num_inference_steps=steps,
+                        grounding=True, processor=ctx["processor"], fit_mode="fit",
+                        lora_scale=scale, generator=g)
+        out[0].save(OUT / f"07_lora_{tag}.png")
+        outs[tag] = np.asarray(out[0], dtype=np.float32)
+
+    diff = np.abs(outs["on"] - outs["off"]).mean()
+    print(f"  разница LoRA on/off: {diff:.2f} (из 255)")
+    if diff < 1.0:
+        raise RuntimeError(f"LoRA ничего не меняет (разница {diff:.2f}) — см. подсказку")
+    return f"разница {diff:.1f} -> {OUT}/07_lora_off.png, 07_lora_on.png"
+
+
+@step(9, "auto_pose: описание позы со второго референса",
+      "Если падает на generate — проверь, что у чекпоинта tie_word_embeddings=True "
+      "и transformers знает Qwen3VLForConditionalGeneration")
+def test_auto_pose(ctx, h, w, steps):
+    import torch
+    import numpy as np
+    from PIL import Image
+    pipe = ctx["pipe"]
+
+    # Сцена с ЯВНОЙ позой: лис стоит, а тут человек с поднятыми руками.
+    before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+    scene = pipe(prompt="photo of a person standing with both arms raised high above the head",
+                 height=h, width=w, num_inference_steps=steps,
+                 guidance_scale=0.0 if pipe.config.is_distilled else 4.5).images[0]
+
+    g = torch.Generator("cuda" if torch.cuda.is_available() else "cpu").manual_seed(0)
+    out = pipe.edit(prompt="create a photo of this fox on a city street",
+                    images=[scene, ctx["ref_image"]], height=h, width=w,
+                    num_inference_steps=steps, grounding=True, processor=ctx["processor"],
+                    fit_mode="fit", auto_pose=True, generator=g)
+    out[0].save(OUT / "08_auto_pose.png")
+
+    pose = pipe.last_pose_description
+    print(f"  описание: {pose}")
+    if not pose or len(pose) < 20:
+        raise RuntimeError("описание позы пустое или подозрительно короткое")
+
+    # Генератор поверх связанных эмбеддингов не должен стоить заметной VRAM.
+    if torch.cuda.is_available():
+        grown = (torch.cuda.memory_allocated() - before) / 1024**3
+        print(f"  прирост VRAM за счёт генератора: {grown:+.2f} ГБ")
+    return f"{len(pose)} симв. -> {OUT/'08_auto_pose.png'}"
+
+
+@step(10, "подмена текстового энкодера",
+      "Ошибка формы -> это не Qwen3-VL-4B (нужен hidden 2560 / 36 слоёв). "
+      "OOM -> шаг держит второй энкодер (~8 ГБ), запусти его отдельно: --only 0,1,10")
+def test_encoder_swap(ctx, h, w, steps):
+    from krea2_studio import DEFAULT_ENCODER, check_compat, encoder_drift, load_text_encoder
+    from transformers import Qwen3VLModel
+    import torch
+    pipe = ctx["pipe"]
+
+    # Шумовой пол: второй экземпляр ТЕХ ЖЕ весов уже расходится с первым на ~5e-5.
+    # Веса побитово те же, дело в отдельном объекте (свои адреса активаций -> другой
+    # выбор ядер cuBLAS в bf16). Без этой опоры любой замер дрейфа не с чем сравнить.
+    same = Qwen3VLModel.from_pretrained(
+        os.environ.get("KREA2_MODEL", "krea/Krea-2-Turbo"),
+        subfolder="text_encoder", dtype=pipe.text_encoder.dtype)
+    floor = encoder_drift(pipe, same)
+    del same
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"  шумовой пол (те же веса, другой экземпляр): mean={floor['mean']}")
+
+    # Веса энкодера у Krea сверены с upstream потензорно: все 713 совпадают.
+    # Значит дрейф обязан лечь в шумовой пол — иначе сломан путь подмены.
+    other = load_text_encoder(DEFAULT_ENCODER, dtype=pipe.text_encoder.dtype)
+    check_compat(other, pipe.transformer, pipe.text_encoder_select_layers)
+    d = encoder_drift(pipe, other)
+    del other
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print(f"  upstream Qwen3-VL-4B-Instruct:              mean={d['mean']}")
+    print(f"  косинус по слоям: {d['per_layer']}")
+    if abs(d["mean"] - floor["mean"]) > 1e-4:
+        raise RuntimeError(
+            f"дрейф {d['mean']} выходит за шумовой пол {floor['mean']} — "
+            "либо сломан путь подмены, либо веса всё-таки не те")
+    return f"дрейф {d['mean']} = шумовой пол {floor['mean']}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--height", type=int, default=864)
@@ -221,6 +334,9 @@ def main():
         (5, test_grounding, (h, w, s)),
         (6, test_boost, (h, w, s)),
         (7, test_geometry, (h, w, s)),
+        (8, test_lora_effect, (h, w, s)),
+        (9, test_auto_pose, (h, w, s)),
+        (10, test_encoder_swap, (h, w, s)),
     ]
 
     print(f"разрешение {h}x{w}, шагов {s}")

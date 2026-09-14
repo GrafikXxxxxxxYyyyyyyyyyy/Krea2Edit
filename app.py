@@ -20,26 +20,50 @@ from krea2_studio.geometry import round_to_multiple
 
 MODEL_ID = os.environ.get("KREA2_MODEL", "krea/Krea-2-Turbo")
 PROCESSOR_ID = os.environ.get("KREA2_PROCESSOR", "Qwen/Qwen3-VL-4B-Instruct")
+# Сменный текстовый энкодер: любой дериватив Qwen3-VL-4B (см. krea2_studio/encoder.py).
+# Пусто — берём тот, что лежит в репозитории модели.
+ENCODER_ID = os.environ.get("KREA2_TEXT_ENCODER", "")
 DTYPE = torch.bfloat16
 
 _pipe = None
 _processor = None
+_lora = None          # откуда взялась edit-LoRA, либо None
 
 
 def get_pipe():
     """Ленивая загрузка. Turbo — 8 шагов без CFG, Raw — 28 шагов с guidance 4.5."""
-    global _pipe, _processor
+    global _pipe, _processor, _lora
     if _pipe is None:
-        from krea2_studio import Krea2EditPipeline
+        from krea2_studio import Krea2EditPipeline, load_edit_lora
         from transformers import AutoProcessor
 
-        _pipe = Krea2EditPipeline.from_pretrained(MODEL_ID, dtype=DTYPE)
+        extra = {}
+        if ENCODER_ID:
+            from krea2_studio import check_compat, load_text_encoder
+            print(f"текстовый энкодер: {ENCODER_ID} (вместо штатного)")
+            extra["text_encoder"] = load_text_encoder(ENCODER_ID, dtype=DTYPE)
+
+        _pipe = Krea2EditPipeline.from_pretrained(MODEL_ID, dtype=DTYPE, **extra)
+        if ENCODER_ID:
+            # Форму проверяем до первой генерации, а не посреди денойз-лупа.
+            check_compat(_pipe.text_encoder, _pipe.transformer,
+                         _pipe.text_encoder_select_layers)
         _pipe.to("cuda" if torch.cuda.is_available() else "cpu")
         # Экономия VRAM: пригодится на картах меньше 40 ГБ.
         if os.environ.get("KREA2_OFFLOAD", "0") == "1":
             _pipe.enable_model_cpu_offload()
         _pipe.vae.enable_tiling()
         _processor = AutoProcessor.from_pretrained(PROCESSOR_ID)
+
+        # Edit-LoRA: без неё вкладка edit вернёт копию референса (см. krea2_studio/lora.py).
+        # Адаптер грузится выключенным и включается только внутри pipe.edit().
+        if os.environ.get("KREA2_EDIT_LORA", "").lower() != "off":
+            try:
+                _lora = load_edit_lora(_pipe)
+                print(f"edit-LoRA: {_lora}")
+            except Exception as e:
+                print(f"ВНИМАНИЕ: edit-LoRA не загрузилась ({type(e).__name__}: {e}).\n"
+                      "  Вкладка edit будет копировать референс, не исполняя инструкцию.")
     return _pipe, _processor
 
 
@@ -68,7 +92,7 @@ def run_t2i(prompt, negative, height, width, steps, guidance, count, seed,
 
 
 def run_edit(prompt, negative, image_a, image_b, height, width, steps, guidance,
-             count, seed, ref_boost, ref_boost_scene, fit_mode, grounding,
+             count, seed, ref_boost, ref_boost_scene, fit_mode, auto_pose, grounding,
              grounding_px, system_prompt, progress=gr.Progress(track_tqdm=True)):
     if image_a is None:
         raise gr.Error("Загрузите хотя бы один референс")
@@ -92,12 +116,16 @@ def run_edit(prompt, negative, image_a, image_b, height, width, steps, guidance,
         ref_boost=float(ref_boost),
         ref_boost_scene=float(ref_boost_scene),
         fit_mode=fit_mode,
+        auto_pose=bool(auto_pose),
         grounding=bool(grounding),
         grounding_px=int(grounding_px),
         system_prompt=system_prompt or None,
         processor=processor,
     )
     note = f"seed: {used} | референсов: {len(images)}"
+    note += f" | edit-LoRA: {_lora}" if _lora else " | БЕЗ edit-LoRA: инструкция не исполняется"
+    if getattr(pipe, "last_pose_description", None):
+        note += f"\n\n**Поза, снятая со сцены:** {pipe.last_pose_description}"
     if float(ref_boost) != 1.0 or float(ref_boost_scene) != 1.0:
         note += " | буст включён (медленнее: отключает FlashAttention)"
     return out, note
@@ -132,30 +160,50 @@ with gr.Blocks(title="krea2-studio") as demo:
     with gr.Tab("Edit по референсам"):
         with gr.Row():
             with gr.Column():
+                gr.Markdown(
+                    "Инструкцию исполняет edit-LoRA `krea2-identity-edit` — она грузится "
+                    "автоматически при первом запросе. Без неё (`KREA2_EDIT_LORA=off`) "
+                    "базовые веса просто скопируют референс.\n\n"
+                    "Описывайте **результат**, а не «возьми с первого изображения»: "
+                    "ссылки на номера картинок модель разрешает ненадёжно. Позу со "
+                    "сцены переносит галочка в «Тонкой настройке».\n\n"
+                    "Если нужно просто сменить фон — **грузите только субъекта** и "
+                    "опишите фон словами. Референс сцены с человеком превращает задачу "
+                    "в двухперсонный монтаж, где лица и одежда смешиваются."
+                )
                 e_prompt = gr.Textbox(label="Инструкция", lines=3,
                                       placeholder="Replace the outfit with a red dress")
                 e_negative = gr.Textbox(label="Негатив", lines=2)
                 with gr.Row():
-                    e_img_a = gr.Image(label="Референс (субъект)", type="pil")
-                    e_img_b = gr.Image(label="Референс 2 — сцена (опционально)", type="pil")
+                    e_img_a = gr.Image(label="1. СУБЪЕКТ — кого сохраняем (лицо, одежда)",
+                                       type="pil")
+                    # Второй слот — просто первый референс в последовательности:
+                    # туда одинаково идут и фон, и предмет одежды для примерки.
+                    e_img_b = gr.Image(label="2. СЦЕНА или ВЕЩЬ — опционально", type="pil")
                 with gr.Row():
                     e_h = gr.Slider(256, 2048, 864, step=16, label="Высота")
                     e_w = gr.Slider(256, 2048, 496, step=16, label="Ширина")
                 with gr.Row():
-                    e_steps = gr.Slider(1, 50, 8, step=1, label="Шагов")
+                    # 8 шагов держат композицию, 12 — лицо; 10 посередине.
+                    e_steps = gr.Slider(1, 50, 10, step=1, label="Шагов")
                     e_cfg = gr.Slider(0.0, 10.0, 0.0, step=0.1, label="Guidance")
                 with gr.Row():
                     e_count = gr.Slider(1, 4, 1, step=1, label="Версий")
                     e_seed = gr.Number(-1, label="Seed (-1 = случайный)", precision=0)
                 with gr.Accordion("Тонкая настройка", open=False):
                     e_boost = gr.Slider(0.1, 8.0, 1.0, step=0.05,
-                                        label="ref_boost (субъект). 1.0 = выкл")
+                                        label="ref_boost (субъект). 1.0 = выкл, ~4 = сильное сходство")
                     e_boost_s = gr.Slider(0.1, 8.0, 1.0, step=0.05,
                                           label="ref_boost (сцена)")
                     gr.Markdown("Буст насыщается: если модель почти не смотрит на "
                                 "референс, `20` даст не больше ~0.5 веса. И он дорог — "
                                 "плотная матрица L×L плюс отключение FlashAttention.")
-                    e_fit = gr.Radio(["crop", "fit"], value="crop", label="Подгонка референса")
+                    # fit — геометрия, под которую обучалась v1.2; crop остался для v1/v1.1.
+                    e_fit = gr.Radio(["fit", "crop"], value="fit", label="Подгонка референса")
+                    # Поза из сцены сама не переносится — её надо описать словами.
+                    # Описание снимается с самого референса, лишней VRAM не стоит.
+                    e_pose = gr.Checkbox(False, label="Перенести позу со сцены (авто-описание, +3 c). "
+                                                      "Включайте, только если поза нужна")
                     e_ground = gr.Checkbox(True, label="Grounded encode (семантический канал)")
                     e_gpx = gr.Slider(0, 1024, 768, step=64,
                                       label="grounding_px (640–768 в распределении)")
@@ -167,7 +215,7 @@ with gr.Blocks(title="krea2-studio") as demo:
                 e_info = gr.Markdown()
         e_run.click(run_edit,
                     [e_prompt, e_negative, e_img_a, e_img_b, e_h, e_w, e_steps, e_cfg,
-                     e_count, e_seed, e_boost, e_boost_s, e_fit, e_ground, e_gpx, e_sys],
+                     e_count, e_seed, e_boost, e_boost_s, e_fit, e_pose, e_ground, e_gpx, e_sys],
                     [e_out, e_info])
 
 

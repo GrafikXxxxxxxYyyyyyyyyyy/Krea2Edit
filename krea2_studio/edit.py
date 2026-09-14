@@ -12,6 +12,9 @@
 
 from __future__ import annotations
 
+import warnings
+from contextlib import ExitStack
+
 import torch
 from PIL import Image
 
@@ -19,8 +22,10 @@ from diffusers import Krea2Pipeline
 from diffusers.pipelines.krea2.pipeline_krea2 import calculate_shift, retrieve_timesteps
 
 from .attention import _BiasHolder, build_ref_bias, ref_boost_active
+from .describe import append_pose, describe_pose
 from .geometry import fit_reference, round_to_multiple
 from .grounding import encode_grounded
+from .lora import edit_lora_active, has_edit_lora
 
 
 class Krea2EditPipeline(Krea2Pipeline):
@@ -112,6 +117,8 @@ class Krea2EditPipeline(Krea2Pipeline):
         ref_boost_scene: float = 1.0,
         boost_mask=None,
         fit_mode: str = "crop",
+        lora_scale: float = 1.0,
+        auto_pose: bool = False,
         grounding: bool = True,
         grounding_px: int = 768,
         system_prompt: str | None = None,
@@ -127,6 +134,16 @@ class Krea2EditPipeline(Krea2Pipeline):
         if not images:
             raise ValueError("edit() требует хотя бы один референс; для t2i зови сам пайплайн")
 
+        # Поза из референса сцены сама не переносится (см. describe.py) — снимаем её
+        # словами с самой картинки и дописываем в инструкцию. Имеет смысл только при
+        # двух референсах: при одном референс И ЕСТЬ субъект, копировать неоткуда.
+        self.last_pose_description = None
+        if auto_pose and len(images) > 1:
+            if processor is None:
+                raise ValueError("auto_pose=True требует processor (AutoProcessor Qwen3-VL)")
+            self.last_pose_description = describe_pose(self, images[0], processor)
+            prompt = append_pose(prompt, self.last_pose_description)
+
         # Дефолты зависят от чекпоинта: Turbo (TDM) дистиллирован под few-step БЕЗ CFG,
         # Raw — под 28 шагов с guidance 4.5. Жёсткие значения здесь означали бы, что
         # вызов без параметров на Turbo делает ~7x лишней работы (3.5x шагов x 2 за CFG)
@@ -137,7 +154,6 @@ class Krea2EditPipeline(Krea2Pipeline):
         if guidance_scale is None:
             guidance_scale = 0.0 if distilled else 4.5
         if distilled and guidance_scale > 0:
-            import warnings
             warnings.warn(
                 f"guidance_scale={guidance_scale} на дистиллированном чекпоинте: "
                 "шаг станет вдвое дороже, а качество скорее упадёт — Turbo обучен под 0.0",
@@ -246,10 +262,22 @@ class Krea2EditPipeline(Krea2Pipeline):
                     latents = self.scheduler.step(v, t, latents, return_dict=False)[0]
                     bar.update()
 
-        if bias is not None:
-            with ref_boost_active(self.transformer, holder):
-                run_loop()
-        else:
+        # --- 6.1 запуск под edit-LoRA ---
+        # Базовые веса Krea 2 — text2image: они копируют референс и не исполняют
+        # инструкцию. Навык edit приносит LoRA (см. lora.py); без неё режим
+        # технически работает, но редактированием не является.
+        if not has_edit_lora(self):
+            warnings.warn(
+                "edit-LoRA не загружена: базовый Krea 2 скопирует референс и "
+                "проигнорирует инструкцию. Загрузи её через "
+                "krea2_studio.load_edit_lora(pipe).",
+                stacklevel=2,
+            )
+
+        with ExitStack() as stack:
+            if bias is not None:
+                stack.enter_context(ref_boost_active(self.transformer, holder))
+            stack.enter_context(edit_lora_active(self, scale=lora_scale))
             run_loop()
 
         # --- 7. декод ---

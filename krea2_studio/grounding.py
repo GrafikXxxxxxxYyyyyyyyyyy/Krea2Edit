@@ -72,13 +72,22 @@ def encode_grounded(
     # и считает image_grid_thw — руками это воспроизводить не надо.
     inputs = processor(text=[text], images=prepared, return_tensors="pt").to(device)
 
-    outputs = pipe.text_encoder(
+    encoder_kwargs = dict(
         input_ids=inputs.input_ids,
         attention_mask=inputs.attention_mask,
-        pixel_values=inputs.pixel_values,
+        # Патчи картинки идут в те же веса, что и всё остальное: процессор отдаёт
+        # их float32, а энкодер загружен в bf16.
+        pixel_values=inputs.pixel_values.to(pipe.text_encoder.dtype),
         image_grid_thw=inputs.image_grid_thw,
         output_hidden_states=True,
     )
+    # transformers >= 5 считает M-RoPE по разметке модальностей и отказывается
+    # угадывать её по input_ids. Процессор отдаёт разметку рядом с input_ids;
+    # на более старых версиях её просто нет — и там она не нужна.
+    if "mm_token_type_ids" in inputs:
+        encoder_kwargs["mm_token_type_ids"] = inputs.mm_token_type_ids
+
+    outputs = pipe.text_encoder(**encoder_kwargs)
 
     hidden_states = torch.stack(
         [outputs.hidden_states[i] for i in pipe.text_encoder_select_layers], dim=2

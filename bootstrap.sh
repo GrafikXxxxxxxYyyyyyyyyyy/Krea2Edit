@@ -37,19 +37,27 @@ print(f'  diffusers {diffusers.__version__}')
 print(f'  transformers {transformers.__version__}')
 print(f'  gradio {gradio.__version__}')
 from diffusers import Krea2Pipeline
-print('  Krea2Pipeline доступен')"
+print('  Krea2Pipeline доступен')
+import peft
+print(f'  peft {peft.__version__}')"
 
 echo
-echo "=== 4/5 прогрев весов (долго: ~30 ГБ) ==="
+echo "=== 4/5 прогрев весов (долго: ~30 ГБ + 1.8 ГБ LoRA) ==="
 # Качаем ДО запуска UI: иначе первый запрос в Gradio висит без объяснений.
 python - <<'PY'
 import os, time, torch
 from krea2_studio import Krea2EditPipeline
+from krea2_studio.lora import resolve_source
 from transformers import AutoProcessor
+from huggingface_hub import hf_hub_download
 mid = os.environ.get("KREA2_MODEL", "krea/Krea-2-Turbo")
 t0 = time.time()
 Krea2EditPipeline.from_pretrained(mid, dtype=torch.bfloat16)
 AutoProcessor.from_pretrained(os.environ.get("KREA2_PROCESSOR", "Qwen/Qwen3-VL-4B-Instruct"))
+# Edit-LoRA: без неё edit-режим копирует референс вместо редактирования.
+repo, fname = resolve_source()
+if fname:
+    hf_hub_download(repo, fname)
 print(f"  веса в кэше за {(time.time()-t0)/60:.1f} мин")
 PY
 

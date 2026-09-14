@@ -31,13 +31,16 @@ def build_ref_bias(
 ) -> torch.Tensor | None:
     """Bias для последовательности [текст | рефы... | цель].
 
-    Возвращает None, если все бусты равны 1.0 и глушить padding не требуется, —
-    это сигнал вызывающему идти быстрым путём без явной маски.
+    Возвращает None, если все бусты равны 1.0, — это сигнал вызывающему идти
+    быстрым путём со штатной маской и FlashAttention.
     """
-    need_boost = any(b != 1.0 for b in boosts)
-    need_pad = text_mask is not None and bool((~text_mask).any())
-    if not need_boost and not need_pad:
+    # Без буста bias не нужен вовсе: штатный forward трансформера сам собирает
+    # key-padding маску из encoder_attention_mask. Матрицу строим только чтобы поднять
+    # референсные столбцы — и тогда уже сами глушим в ней паддинг, потому что нашей
+    # маской мы штатную заменяем целиком.
+    if not any(b != 1.0 for b in boosts):
         return None
+    need_pad = text_mask is not None and bool((~text_mask).any())
 
     offs = [text_len]
     for n in ref_lens:
@@ -96,19 +99,25 @@ class _BoostedProcessor:
                           image_rotary_emb=image_rotary_emb, **kw)
 
 
+# Bias живёт на объединённой последовательности [текст | рефы | цель], а её видят
+# только основные блоки. text_fusion гоняет внимание по другим осям (по 12 слоям
+# энкодера и по токенам текста), и подстановка нашей матрицы туда — гарантированный
+# развал формы.
+MAIN_BLOCK_PREFIX = "transformer_blocks."
+
+
 @contextmanager
 def ref_boost_active(transformer, holder: _BiasHolder):
-    """Временно подменить процессоры внимания на бустящие.
-
-    NOTE: путь проверен только логически — на игрушечной модели в ноутбуке 05
-    эквивалентная механика даёт ожидаемый результат, но подмену процессоров
-    у реального Krea2Transformer2DModel надо прогнать на GPU. Если что-то пойдёт
-    не так, достаточно не использовать буст: основной edit-путь его не требует.
-    """
+    """Временно подменить процессоры внимания основных блоков на бустящие."""
     original = transformer.attn_processors
-    patched = {k: _BoostedProcessor(v, holder) for k, v in original.items()}
-    transformer.set_attn_processor(patched)
+    patched = {
+        k: (_BoostedProcessor(v, holder) if k.startswith(MAIN_BLOCK_PREFIX) else v)
+        for k, v in original.items()
+    }
+    # set_attn_processor вычерпывает словарь через pop — отдаём копии, иначе
+    # восстанавливать исходные процессоры будет уже нечем.
+    transformer.set_attn_processor(dict(patched))
     try:
         yield
     finally:
-        transformer.set_attn_processor(original)
+        transformer.set_attn_processor(dict(original))

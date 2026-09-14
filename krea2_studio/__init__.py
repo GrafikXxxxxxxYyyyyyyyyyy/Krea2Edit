@@ -6,13 +6,19 @@ Krea 2), а geometry/attention полезны и без него — напри�
 """
 
 from .attention import build_ref_bias
+from .describe import POSE_QUESTION, append_pose, describe_pose
+from .encoder import DEFAULT_ENCODER, check_compat, encoder_drift, load_text_encoder
 from .geometry import fit_reference, round_to_multiple, PIXELS_PER_TOKEN
 from .grounding import DEFAULT_GROUNDING_PX, DEFAULT_SYSTEM_PROMPT
+from .lora import DEFAULT_LORA_FILE, DEFAULT_LORA_REPO, has_edit_lora, load_edit_lora
 
 __all__ = [
     "Krea2EditPipeline", "fit_reference", "round_to_multiple", "PIXELS_PER_TOKEN",
     "encode_grounded", "build_ref_bias",
     "DEFAULT_SYSTEM_PROMPT", "DEFAULT_GROUNDING_PX",
+    "load_edit_lora", "has_edit_lora", "DEFAULT_LORA_REPO", "DEFAULT_LORA_FILE",
+    "describe_pose", "append_pose", "POSE_QUESTION",
+    "load_text_encoder", "check_compat", "encoder_drift", "DEFAULT_ENCODER",
 ]
 
 

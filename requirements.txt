@@ -5,6 +5,9 @@ git+https://github.com/huggingface/diffusers.git
 # Qwen3-VL как текстовый энкодер требует свежий transformers.
 transformers>=4.57.0
 accelerate>=1.0.0
+
+# Edit-режиму нужна LoRA (см. krea2_studio/lora.py), а её грузит peft.
+peft>=0.14.0
 torch>=2.4.0
 torchvision
 safetensors
