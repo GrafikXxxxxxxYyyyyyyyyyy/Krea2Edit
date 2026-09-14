@@ -1,0 +1,33 @@
+"""krea2-studio — text2image и edit по референсам на чистом diffusers.
+
+Krea2EditPipeline импортируется ЛЕНИВО: он требует diffusers >= 0.40 (где появился
+Krea 2), а geometry/attention полезны и без него — например, чтобы разобрать геометрию
+на машине без GPU и свежего diffusers.
+"""
+
+from .attention import build_ref_bias
+from .geometry import fit_reference, round_to_multiple, PIXELS_PER_TOKEN
+from .grounding import DEFAULT_GROUNDING_PX, DEFAULT_SYSTEM_PROMPT
+
+__all__ = [
+    "Krea2EditPipeline", "fit_reference", "round_to_multiple", "PIXELS_PER_TOKEN",
+    "encode_grounded", "build_ref_bias",
+    "DEFAULT_SYSTEM_PROMPT", "DEFAULT_GROUNDING_PX",
+]
+
+
+def __getattr__(name):
+    if name == "Krea2EditPipeline":
+        try:
+            from .edit import Krea2EditPipeline
+        except ImportError as e:
+            raise ImportError(
+                "Krea2EditPipeline требует diffusers с поддержкой Krea 2 (>= 0.40).\n"
+                "  pip install 'git+https://github.com/huggingface/diffusers.git'\n"
+                f"исходная ошибка: {e}"
+            ) from e
+        return Krea2EditPipeline
+    if name == "encode_grounded":
+        from .grounding import encode_grounded
+        return encode_grounded
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

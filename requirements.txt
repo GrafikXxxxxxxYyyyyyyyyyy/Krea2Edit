@@ -1,0 +1,16 @@
+# Krea 2 появился в diffusers 0.40 — на момент написания ставим из исходников.
+# Когда 0.40+ доедет до PyPI, строку можно заменить на: diffusers>=0.40.0
+git+https://github.com/huggingface/diffusers.git
+
+# Qwen3-VL как текстовый энкодер требует свежий transformers.
+transformers>=4.57.0
+accelerate>=1.0.0
+torch>=2.4.0
+torchvision
+safetensors
+sentencepiece
+pillow
+numpy
+
+# UI писался под 4.44, фактически проверен на 6.5.1 — верхняя граница на всякий случай.
+gradio>=4.44.0,<7
