@@ -69,18 +69,14 @@ def check_env(ctx):
       "Если не встала LoRA -> pip install peft")
 def load_model(ctx):
     import torch
-    from krea2_studio import Krea2EditPipeline, load_edit_lora
+    from krea2_studio import load_edit_lora, load_pipeline
     from transformers import AutoProcessor
 
     model_id = os.environ.get("KREA2_MODEL", "krea/Krea-2-Turbo")
     print(f"  модель: {model_id}  (первый запуск качает ~30 ГБ)")
-    pipe = Krea2EditPipeline.from_pretrained(model_id, dtype=torch.bfloat16)
-
-    if os.environ.get("KREA2_OFFLOAD", "0") == "1":
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe.to("cuda" if torch.cuda.is_available() else "cpu")
-    pipe.vae.enable_tiling()
+    # Тот же путь сборки, что и в app.py: KREA2_TRANSFORMER, KREA2_DISTILLED,
+    # KREA2_TEXT_ENCODER и KREA2_OFFLOAD учитываются здесь же.
+    pipe = load_pipeline(dtype=torch.bfloat16)
 
     ctx["pipe"] = pipe
     ctx["processor"] = AutoProcessor.from_pretrained(
@@ -279,24 +275,13 @@ def test_auto_pose(ctx, h, w, steps):
       "OOM -> шаг держит второй энкодер (~8 ГБ), запусти его отдельно: --only 0,1,10")
 def test_encoder_swap(ctx, h, w, steps):
     from krea2_studio import DEFAULT_ENCODER, check_compat, encoder_drift, load_text_encoder
-    from transformers import Qwen3VLModel
     import torch
     pipe = ctx["pipe"]
 
-    # Шумовой пол: второй экземпляр ТЕХ ЖЕ весов уже расходится с первым на ~5e-5.
-    # Веса побитово те же, дело в отдельном объекте (свои адреса активаций -> другой
-    # выбор ядер cuBLAS в bf16). Без этой опоры любой замер дрейфа не с чем сравнить.
-    same = Qwen3VLModel.from_pretrained(
-        os.environ.get("KREA2_MODEL", "krea/Krea-2-Turbo"),
-        subfolder="text_encoder", dtype=pipe.text_encoder.dtype)
-    floor = encoder_drift(pipe, same)
-    del same
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    print(f"  шумовой пол (те же веса, другой экземпляр): mean={floor['mean']}")
-
-    # Веса энкодера у Krea сверены с upstream потензорно: все 713 совпадают.
-    # Значит дрейф обязан лечь в шумовой пол — иначе сломан путь подмены.
+    # Веса энкодера у Krea сверены с upstream потензорно: все 713 совпадают. Шумового
+    # пола нет — второй экземпляр тех же весов даёт побитово те же hidden states, —
+    # значит и upstream обязан совпасть бит в бит. Иначе сломан путь подмены (например,
+    # частоты RoPE огрублены до bf16 — см. encoder_drift).
     other = load_text_encoder(DEFAULT_ENCODER, dtype=pipe.text_encoder.dtype)
     check_compat(other, pipe.transformer, pipe.text_encoder_select_layers)
     d = encoder_drift(pipe, other)
@@ -304,92 +289,121 @@ def test_encoder_swap(ctx, h, w, steps):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print(f"  upstream Qwen3-VL-4B-Instruct:              mean={d['mean']}")
+    print(f"  upstream Qwen3-VL-4B-Instruct: mean={d['mean']}, identical={d['identical']}")
     print(f"  косинус по слоям: {d['per_layer']}")
-    if abs(d["mean"] - floor["mean"]) > 1e-4:
+    if not d["identical"]:
         raise RuntimeError(
-            f"дрейф {d['mean']} выходит за шумовой пол {floor['mean']} — "
+            f"upstream разошёлся со штатным (mean {d['mean']}) — "
             "либо сломан путь подмены, либо веса всё-таки не те")
-    return f"дрейф {d['mean']} = шумовой пол {floor['mean']}"
+    return "upstream совпал со штатным бит в бит"
 
 
 @step(11, "конвертер чекпоинтов ComfyUI",
       "Маппинг имён разошёлся с текущим diffusers — смотри krea2_studio/checkpoint.py")
 def test_checkpoint_mapping(ctx, h, w, steps):
-    """Самопроверка маппинга: синтетический ComfyUI-словарь -> имена diffusers.
+    """Самопроверка конвертера: синтетический ComfyUI-файл -> Krea2Transformer2DModel.
 
-    Не требует ни файла, ни GPU — ловит расхождение имён до того, как ты скачаешь
-    двадцать гигабайт файнтюна. Если задан KREA2_TRANSFORMER, дополнительно
-    проверяется, что реальный файл грузится и даёт картинку.
+    Не требует ни настоящего файла, ни GPU — ловит расхождение с diffusers до того,
+    как ты скачаешь двенадцать гигабайт файнтюна. Проверяется весь путь загрузки,
+    а не только имена: крошечная эталонная модель сохраняется в раскладке ComfyUI
+    (большие матрицы в fp8, как у DAF-K2T), грузится обратно через load_transformer
+    и сверяется потензорно вместе с конфигом.
+
+    Если задан KREA2_TRANSFORMER, дополнительно проверяется, что пайплайн из шага 1
+    собран именно на этом файле, и на нём генерируется картинка.
     """
     import os
+    import tempfile
     import torch
-    from krea2_studio.checkpoint import convert_comfy_state_dict, infer_config
-
-    L, F_, HD, H, KV, TXT, TAPS, TDIM, INTER, PATCH, CH = 2, 64, 16, 4, 2, 32, 12, 8, 128, 2, 4
-
-    def blk(prefix, dim):
-        d = {f"{prefix}.prenorm.scale": torch.zeros(dim),
-             f"{prefix}.postnorm.scale": torch.zeros(dim),
-             f"{prefix}.attn.wq.weight": torch.zeros(HD * H, dim),
-             f"{prefix}.attn.wk.weight": torch.zeros(HD * KV, dim),
-             f"{prefix}.attn.wv.weight": torch.zeros(HD * KV, dim),
-             f"{prefix}.attn.gate.weight": torch.zeros(dim, dim),
-             f"{prefix}.attn.qknorm.qnorm.scale": torch.zeros(HD),
-             f"{prefix}.attn.qknorm.knorm.scale": torch.zeros(HD),
-             f"{prefix}.attn.wo.weight": torch.zeros(dim, dim)}
-        for name, shape in [("gate", (INTER, dim)), ("up", (INTER, dim)), ("down", (dim, INTER))]:
-            d[f"{prefix}.mlp.{name}.weight"] = torch.zeros(*shape)
-        return d
-
-    comfy = {
-        "first.weight": torch.zeros(F_, CH * PATCH * PATCH), "first.bias": torch.zeros(F_),
-        "tmlp.0.weight": torch.zeros(F_, TDIM), "tmlp.0.bias": torch.zeros(F_),
-        "tmlp.2.weight": torch.zeros(F_, F_), "tmlp.2.bias": torch.zeros(F_),
-        "tproj.1.weight": torch.zeros(F_ * 6, F_), "tproj.1.bias": torch.zeros(F_ * 6),
-        "txtmlp.0.scale": torch.zeros(TXT),
-        "txtmlp.1.weight": torch.zeros(F_, TXT), "txtmlp.1.bias": torch.zeros(F_),
-        "txtmlp.3.weight": torch.zeros(F_, F_), "txtmlp.3.bias": torch.zeros(F_),
-        "txtfusion.projector.weight": torch.zeros(1, TAPS),
-        "last.norm.scale": torch.zeros(F_),
-        "last.linear.weight": torch.zeros(PATCH * PATCH * CH, F_),
-        "last.linear.bias": torch.zeros(PATCH * PATCH * CH),
-        "last.modulation.lin": torch.zeros(2, F_),
-    }
-    for i in range(L):
-        comfy.update(blk(f"blocks.{i}", F_))
-        comfy[f"blocks.{i}.mod.lin"] = torch.zeros(6 * F_)
-    for grp in ("layerwise_blocks", "refiner_blocks"):
-        for i in range(2):
-            comfy.update(blk(f"txtfusion.{grp}.{i}", TXT))
-
-    out = convert_comfy_state_dict(comfy, strict=True)
-    assert len(out) == len(comfy), f"потеряно {len(comfy) - len(out)} тензоров"
-    assert tuple(out["transformer_blocks.0.scale_shift_table"].shape) == (6, F_)
-    assert tuple(out["final_layer.scale_shift_table"].shape) == (2, F_)
-
-    cfg = infer_config(out)
-    assert cfg["num_layers"] == L and cfg["num_attention_heads"] == H, cfg
-
-    # Сверяем с тем, что РЕАЛЬНО ждёт текущий diffusers, а не с нашим списком.
     from diffusers import Krea2Transformer2DModel
-    expected = set(Krea2Transformer2DModel(**cfg).state_dict())
-    got = set(out)
-    if got != expected:
-        raise AssertionError(
-            f"имена разошлись с diffusers: лишних {len(got - expected)}, "
-            f"не хватает {len(expected - got)}\n"
-            f"  лишние: {sorted(got - expected)[:6]}\n"
-            f"  нет:    {sorted(expected - got)[:6]}")
-    print(f"  маппинг сошёлся: {len(out)} тензоров, имена совпали с diffusers")
+    from safetensors.torch import save_file
+    from krea2_studio.checkpoint import comfy_key_to_diffusers, infer_config, load_transformer
+
+    # Нештатные размеры везде, где конфиг выводится из форм: дефолт diffusers
+    # не должен совпасть с ответом случайно.
+    cfg0 = dict(in_channels=16, num_layers=2, attention_head_dim=16, num_attention_heads=4,
+                num_key_value_heads=2, intermediate_size=128, timestep_embed_dim=8,
+                text_hidden_dim=32, num_text_layers=12, text_num_attention_heads=2,
+                text_num_key_value_heads=1, text_intermediate_size=48,
+                num_layerwise_text_blocks=2, num_refiner_text_blocks=3,
+                axes_dims_rope=(4, 6, 6))
+    torch.manual_seed(0)
+    ref = {k: torch.randn_like(v) for k, v in Krea2Transformer2DModel(**cfg0).state_dict().items()}
+
+    # Имена — так, как их пишет ComfyUI (comfy/ldm/krea2/model.py).
+    def blk(prefix):
+        names = [f"{prefix}.prenorm.scale", f"{prefix}.postnorm.scale",
+                 f"{prefix}.attn.qknorm.qnorm.scale", f"{prefix}.attn.qknorm.knorm.scale"]
+        names += [f"{prefix}.attn.{n}.weight" for n in ("wq", "wk", "wv", "gate", "wo")]
+        names += [f"{prefix}.mlp.{n}.weight" for n in ("gate", "up", "down")]
+        return names
+
+    names = ["first.weight", "first.bias", "tmlp.0.weight", "tmlp.0.bias",
+             "tmlp.2.weight", "tmlp.2.bias", "tproj.1.weight", "tproj.1.bias",
+             "txtmlp.0.scale", "txtmlp.1.weight", "txtmlp.1.bias",
+             "txtmlp.3.weight", "txtmlp.3.bias", "txtfusion.projector.weight",
+             "last.norm.scale", "last.linear.weight", "last.linear.bias", "last.modulation.lin"]
+    for i in range(cfg0["num_layers"]):
+        names += blk(f"blocks.{i}") + [f"blocks.{i}.mod.lin"]
+    for grp, n in (("layerwise_blocks", cfg0["num_layerwise_text_blocks"]),
+                   ("refiner_blocks", cfg0["num_refiner_text_blocks"])):
+        for i in range(n):
+            names += blk(f"txtfusion.{grp}.{i}")
+
+    comfy, expected = {}, {}
+    for raw in names:
+        new = comfy_key_to_diffusers(raw)
+        if new is None or new not in ref:
+            raise AssertionError(f"{raw} -> {new}: такого имени в diffusers нет")
+        v = ref[new]
+        if new.startswith("transformer_blocks.") and new.endswith("scale_shift_table"):
+            v = v.flatten()                           # ComfyUI хранит (6*dim,)
+        if v.ndim == 2 and "norm" not in new:
+            v = v.to(torch.float8_e4m3fn)             # как у fp8-сборок с CivitAI
+        comfy["model.diffusion_model." + raw] = v.contiguous()
+        expected[new] = v
+    missing = set(ref) - set(expected)
+    if missing:
+        raise AssertionError(f"маппинг не покрывает {len(missing)} имён diffusers: "
+                             f"{sorted(missing)[:6]}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "synthetic_comfy.safetensors")
+        save_file(comfy, path)
+        model = load_transformer(path, dtype=torch.bfloat16)
+
+    got_cfg = {k: model.config[k] for k in cfg0}
+    got_cfg["axes_dims_rope"] = tuple(got_cfg["axes_dims_rope"])
+    if got_cfg != cfg0:
+        diff = {k: (cfg0[k], got_cfg[k]) for k in cfg0 if cfg0[k] != got_cfg[k]}
+        raise AssertionError(f"конфиг из форм разошёлся (ждали, получили): {diff}")
+
+    sd = model.state_dict()
+    for k, v in expected.items():
+        want_dtype = torch.float32 if "norm" in k.split(".")[-2] else torch.bfloat16
+        if sd[k].dtype != want_dtype:
+            raise AssertionError(f"{k}: dtype {sd[k].dtype}, ждали {want_dtype}")
+        if sd[k].device.type == "meta":
+            raise AssertionError(f"{k}: остался на meta — вес не загрузился")
+        want = v.float().reshape(sd[k].shape).to(want_dtype)
+        if not torch.equal(sd[k], want):
+            raise AssertionError(f"{k}: значения не совпали после загрузки")
+    print(f"  синтетический файл: {len(comfy)} тензоров, конфиг и значения сошлись, "
+          "fp8 -> bf16, нормы fp32")
 
     path = os.environ.get("KREA2_TRANSFORMER", "")
     if not path:
         return "синтетика OK (KREA2_TRANSFORMER не задан — реальный файл не проверялся)"
+    if "pipe" not in ctx:
+        return "синтетика OK (реальный файл проверяется вместе с шагом 1: --only 1,11)"
 
     from krea2_studio.checkpoint import guess_distilled
-    print(f"  проверяю реальный файл: {path} (distilled по имени: {guess_distilled(path)})")
     pipe = ctx["pipe"]
+    src = getattr(pipe.transformer, "_krea2_source", None)
+    if src != str(path):
+        raise AssertionError(f"пайплайн собран не на {path} (трансформер: {src or 'штатный'})")
+    print(f"  трансформер из файла: {path}")
+    print(f"  is_distilled={pipe.config.is_distilled} (по имени: {guess_distilled(path)})")
     g = torch.Generator("cuda" if torch.cuda.is_available() else "cpu").manual_seed(0)
     img = pipe(prompt="a red fox in the snow, photo", height=h, width=w,
                num_inference_steps=steps,

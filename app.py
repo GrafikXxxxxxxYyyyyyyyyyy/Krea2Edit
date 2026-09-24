@@ -5,7 +5,8 @@
     python app.py
 
 Модель грузится ЛЕНИВО — при первом запросе, а не при импорте: иначе HF Space падает
-по таймауту старта, а на vast.ai не увидишь ошибку конфигурации до первой генерации.
+по таймауту старта. Для долгоживущего сервиса лучше KREA2_PRELOAD=1: модель грузится
+до открытия порта, и ошибка конфигурации видна в логе сразу, а не по первому клику.
 """
 
 from __future__ import annotations
@@ -18,17 +19,13 @@ import torch
 
 from krea2_studio.geometry import round_to_multiple
 
-MODEL_ID = os.environ.get("KREA2_MODEL", "krea/Krea-2-Turbo")
 PROCESSOR_ID = os.environ.get("KREA2_PROCESSOR", "Qwen/Qwen3-VL-4B-Instruct")
-# Сменный текстовый энкодер: любой дериватив Qwen3-VL-4B (см. krea2_studio/encoder.py).
-# Пусто — берём тот, что лежит в репозитории модели.
-ENCODER_ID = os.environ.get("KREA2_TEXT_ENCODER", "")
-# Свой чекпоинт трансформера: путь к одиночному .safetensors в раскладке ComfyUI
-# (файнтюны с CivitAI). Остальные компоненты берутся из KREA2_MODEL.
-TRANSFORMER_FILE = os.environ.get("KREA2_TRANSFORMER", "")
-# Дистиллированный ли чекпоинт: от этого зависят расписание и дефолты шагов.
-# Пусто — угадываем по имени файла, "1"/"0" — задать явно.
-DISTILLED_ENV = os.environ.get("KREA2_DISTILLED", "")
+# Модель, свой трансформер, энкодер и offload читает krea2_studio/loader.py.
+# Здесь — только подпись, чтобы в интерфейсе было видно, на чём идёт генерация.
+CHECKPOINT = (os.path.basename(os.environ.get("KREA2_TRANSFORMER", ""))
+              or os.environ.get("KREA2_MODEL", "krea/Krea-2-Turbo"))
+if os.environ.get("KREA2_TEXT_ENCODER"):
+    CHECKPOINT += f" + энкодер {os.environ['KREA2_TEXT_ENCODER']}"
 DTYPE = torch.bfloat16
 
 _pipe = None
@@ -40,46 +37,12 @@ def get_pipe():
     """Ленивая загрузка. Turbo — 8 шагов без CFG, Raw — 28 шагов с guidance 4.5."""
     global _pipe, _processor, _lora
     if _pipe is None:
-        from krea2_studio import Krea2EditPipeline, load_edit_lora
+        from krea2_studio import load_edit_lora, load_pipeline
         from transformers import AutoProcessor
 
-        extra = {}
-        if TRANSFORMER_FILE:
-            from krea2_studio import guess_distilled, load_transformer
-            print(f"трансформер: {TRANSFORMER_FILE} (вместо штатного)")
-            extra["transformer"] = load_transformer(TRANSFORMER_FILE, dtype=DTYPE)
-
-        if ENCODER_ID:
-            from krea2_studio import check_compat, load_text_encoder
-            print(f"текстовый энкодер: {ENCODER_ID} (вместо штатного)")
-            extra["text_encoder"] = load_text_encoder(ENCODER_ID, dtype=DTYPE)
-
-        _pipe = Krea2EditPipeline.from_pretrained(MODEL_ID, dtype=DTYPE, **extra)
-        if ENCODER_ID:
-            # Форму проверяем до первой генерации, а не посреди денойз-лупа.
-            check_compat(_pipe.text_encoder, _pipe.transformer,
-                         _pipe.text_encoder_select_layers)
-        if TRANSFORMER_FILE:
-            # is_distilled определяет сдвиг расписания (mu) и дефолты шагов/guidance.
-            # Ошибиться тут дороже, чем спросить: Turbo на расписании Raw даёт мыло.
-            if DISTILLED_ENV:
-                distilled = DISTILLED_ENV == "1"
-                src = "KREA2_DISTILLED"
-            else:
-                guessed = guess_distilled(TRANSFORMER_FILE)
-                distilled = _pipe.config.is_distilled if guessed is None else guessed
-                src = "имя файла" if guessed is not None else "репозиторий KREA2_MODEL"
-                if guessed is None:
-                    print("ВНИМАНИЕ: по имени файла не понять, дистиллированный ли чекпоинт.\n"
-                          "  Если результат мыльный или пережжённый — задай KREA2_DISTILLED=1 или 0.")
-            _pipe.register_to_config(is_distilled=distilled)
-            print(f"is_distilled={distilled} (источник: {src})")
-
-        _pipe.to("cuda" if torch.cuda.is_available() else "cpu")
-        # Экономия VRAM: пригодится на картах меньше 40 ГБ.
-        if os.environ.get("KREA2_OFFLOAD", "0") == "1":
-            _pipe.enable_model_cpu_offload()
-        _pipe.vae.enable_tiling()
+        # Свой трансформер, сменный энкодер, offload — всё по переменным окружения,
+        # так же, как в smoke_test.py (см. krea2_studio/loader.py).
+        _pipe = load_pipeline(dtype=DTYPE)
         _processor = AutoProcessor.from_pretrained(PROCESSOR_ID)
 
         # Edit-LoRA: без неё вкладка edit вернёт копию референса (см. krea2_studio/lora.py).
@@ -115,7 +78,7 @@ def run_t2i(prompt, negative, height, width, steps, guidance, count, seed,
         num_images_per_prompt=int(count),
         generator=gen,
     ).images
-    return images, f"seed: {used}"
+    return images, f"seed: {used} | модель: {CHECKPOINT}"
 
 
 def run_edit(prompt, negative, image_a, image_b, height, width, steps, guidance,
@@ -149,7 +112,7 @@ def run_edit(prompt, negative, image_a, image_b, height, width, steps, guidance,
         system_prompt=system_prompt or None,
         processor=processor,
     )
-    note = f"seed: {used} | референсов: {len(images)}"
+    note = f"seed: {used} | модель: {CHECKPOINT} | референсов: {len(images)}"
     note += f" | edit-LoRA: {_lora}" if _lora else " | БЕЗ edit-LoRA: инструкция не исполняется"
     if getattr(pipe, "last_pose_description", None):
         note += f"\n\n**Поза, снятая со сцены:** {pipe.last_pose_description}"
@@ -159,7 +122,8 @@ def run_edit(prompt, negative, image_a, image_b, height, width, steps, guidance,
 
 
 with gr.Blocks(title="krea2-studio") as demo:
-    gr.Markdown("# krea2-studio\nText2image и edit по референсам на чистом diffusers.")
+    gr.Markdown("# krea2-studio\nText2image и edit по референсам на чистом diffusers. "
+                f"Модель: `{CHECKPOINT}`.")
 
     with gr.Tab("Text → Image"):
         with gr.Row():
@@ -247,6 +211,14 @@ with gr.Blocks(title="krea2-studio") as demo:
 
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0",
+    if os.environ.get("KREA2_PRELOAD", "0") == "1":
+        get_pipe()
+    # Публичная ссылка *.gradio.live открыта всем, у кого она есть: GRADIO_AUTH="логин:пароль"
+    # закрывает интерфейс паролем. Пусто — без пароля.
+    auth = os.environ.get("GRADIO_AUTH", "")
+    auth = tuple(auth.split(":", 1)) if ":" in auth else None
+    # За прокси с авторизацией (Caddy на vast.ai) слушаем только 127.0.0.1.
+    demo.queue().launch(server_name=os.environ.get("HOST", "0.0.0.0"),
                         server_port=int(os.environ.get("PORT", 7860)),
-                        share=os.environ.get("GRADIO_SHARE", "0") == "1")
+                        share=os.environ.get("GRADIO_SHARE", "0") == "1",
+                        auth=auth)

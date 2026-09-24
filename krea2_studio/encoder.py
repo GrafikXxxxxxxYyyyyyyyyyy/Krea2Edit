@@ -56,18 +56,25 @@ def encoder_drift(pipe, other_encoder, prompt: str = "a photograph of a city str
     Возвращает косинусную близость по каждому из 12 снимаемых слоёв и в среднем.
     Чем ниже, тем дальше вход диффузии от того, на чём её учили.
 
-    ВАЖНО про шумовой пол: ровно 1.0 не бывает даже при побитово одинаковых весах.
-    Второй экземпляр тех же весов уже даёт ~0.99995 — у него свои адреса активаций,
-    и в bf16 это меняет выбор ядер cuBLAS. Измерено: второй экземпляр весов Krea и
-    upstream Qwen3-VL-4B-Instruct дают одинаковые 0.99995. Так что сравнивать дрейф
-    чужого файнтюна надо не с единицей, а с этим полом.
+    Шумового пола нет: второй экземпляр тех же весов даёт побитово те же hidden
+    states (identical=True), так что любое отклонение от 1.0 — это разница весов.
+
+    ВАЖНО про dtype. Энкодер переносится только по устройству, без приведения типа:
+    transformers держит частоты RoPE (`rotary_emb.inv_freq` у текста и у vision) в
+    fp32, а `.to(dtype=bf16)` огрубляет и их. Раньше так и было, и это давало
+    фиктивный «пол» 0.99995 на тексте и ~0.995 на grounded-пути. Энкодер грузите
+    в том же dtype, что и штатный (load_text_encoder по умолчанию bf16).
     """
     import torch.nn.functional as F
 
     original = pipe.text_encoder
     try:
         a, mask = pipe.get_text_hidden_states(prompt, max_sequence_length, pipe._execution_device)
-        pipe.text_encoder = other_encoder.to(pipe._execution_device, dtype=original.dtype)
+        if next(other_encoder.parameters()).dtype != original.dtype:
+            raise ValueError(
+                f"энкодер в {next(other_encoder.parameters()).dtype}, штатный в "
+                f"{original.dtype}: загрузите его в том же dtype (load_text_encoder(dtype=...))")
+        pipe.text_encoder = other_encoder.to(pipe._execution_device)
         b, _ = pipe.get_text_hidden_states(prompt, max_sequence_length, pipe._execution_device)
     finally:
         pipe.text_encoder = original

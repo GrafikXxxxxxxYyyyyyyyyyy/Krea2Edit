@@ -8,4 +8,6 @@ venv/
 smoke_out/
 .gradio/
 checkpoint_header.json
-smoke_out/
+
+# токены и настройки, которые пишет setup.sh
+.env

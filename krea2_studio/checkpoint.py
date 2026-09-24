@@ -77,6 +77,89 @@ def _convert_block_inner(rest: str) -> str | None:
     return None
 
 
+def comfy_key_to_diffusers(raw_key: str) -> str | None:
+    """Имя тензора ComfyUI -> имя в `Krea2Transformer2DModel`. None — не сопоставилось.
+
+    Работает только с именами, без значений: так маппинг можно прогнать по заголовку
+    safetensors, не читая сами веса.
+    """
+    key = _strip_prefix(raw_key)
+    new: str | None = None
+
+    # --- верхний уровень ---
+    if key.startswith("first."):
+        new = "img_in." + key.split(".")[-1]
+    elif key.startswith("tmlp."):
+        idx = key.split(".")[1]
+        new = {"0": "time_embed.linear_1.", "2": "time_embed.linear_2."}.get(idx)
+        new = new + key.split(".")[-1] if new else None
+    elif key.startswith("tproj."):
+        # Sequential(GELU, Linear) — веса только у элемента 1
+        if key.split(".")[1] == "1":
+            new = "time_mod_proj." + key.split(".")[-1]
+    elif key.startswith("txtmlp."):
+        idx = key.split(".")[1]
+        if idx == "0":                       # RMSNorm: scale -> weight
+            new = "txt_in.norm.weight"
+        else:
+            head = {"1": "txt_in.linear_1.", "3": "txt_in.linear_2."}.get(idx)
+            new = head + key.split(".")[-1] if head else None
+
+    # --- последний слой ---
+    elif key.startswith("last."):
+        rest = key[len("last."):]
+        if rest == "modulation.lin":
+            new = "final_layer.scale_shift_table"
+        elif rest.startswith("norm."):
+            new = "final_layer.norm.weight"
+        elif rest.startswith("linear."):
+            new = "final_layer.linear." + rest.split(".")[-1]
+
+    # --- блоки трансформера ---
+    elif key.startswith("blocks."):
+        m = re.match(r"blocks\.(\d+)\.(.+)$", key)
+        if m:
+            n, rest = m.group(1), m.group(2)
+            if rest == "mod.lin":
+                new = f"transformer_blocks.{n}.scale_shift_table"
+            else:
+                inner = _convert_block_inner(rest)
+                new = f"transformer_blocks.{n}.{inner}" if inner else None
+
+    # --- стадия слияния текста ---
+    elif key.startswith("txtfusion."):
+        rest = key[len("txtfusion."):]
+        if rest.startswith("projector."):
+            new = "text_fusion.projector." + rest.split(".")[-1]
+        else:
+            m = re.match(r"(layerwise_blocks|refiner_blocks)\.(\d+)\.(.+)$", rest)
+            if m:
+                inner = _convert_block_inner(m.group(3))
+                new = f"text_fusion.{m.group(1)}.{m.group(2)}.{inner}" if inner else None
+
+    # RMSNorm: параметр называется scale в ComfyUI и weight в diffusers
+    if new is not None and new.endswith(".scale"):
+        new = new[: -len(".scale")] + ".weight"
+    return new
+
+
+def _fix_value(new_key: str, value: torch.Tensor) -> torch.Tensor:
+    """Таблица модуляции блока хранится плоской (6*dim,), diffusers ждёт (6, dim)."""
+    if new_key.endswith("scale_shift_table") and value.ndim == 1:
+        return value.reshape(6, -1)
+    return value
+
+
+def _raise_unmatched(unmatched: list[str]) -> None:
+    head = "\n  ".join(unmatched[:15])
+    raise ValueError(
+        f"не удалось сопоставить {len(unmatched)} ключей:\n  {head}"
+        + ("\n  ..." if len(unmatched) > 15 else "")
+        + "\n\nЭто не раскладка ComfyUI для Krea 2 — возможно другая архитектура "
+          "или уже diffusers-формат."
+    )
+
+
 def convert_comfy_state_dict(state_dict: dict[str, torch.Tensor],
                              strict: bool = True) -> dict[str, torch.Tensor]:
     """Перевести веса трансформера из раскладки ComfyUI в раскладку diffusers.
@@ -88,82 +171,14 @@ def convert_comfy_state_dict(state_dict: dict[str, torch.Tensor],
     unmatched: list[str] = []
 
     for raw_key, value in state_dict.items():
-        key = _strip_prefix(raw_key)
-        new: str | None = None
-
-        # --- верхний уровень ---
-        if key.startswith("first."):
-            new = "img_in." + key.split(".")[-1]
-        elif key.startswith("tmlp."):
-            idx = key.split(".")[1]
-            new = {"0": "time_embed.linear_1.", "2": "time_embed.linear_2."}.get(idx)
-            new = new + key.split(".")[-1] if new else None
-        elif key.startswith("tproj."):
-            # Sequential(GELU, Linear) — веса только у элемента 1
-            if key.split(".")[1] == "1":
-                new = "time_mod_proj." + key.split(".")[-1]
-        elif key.startswith("txtmlp."):
-            idx = key.split(".")[1]
-            if idx == "0":                       # RMSNorm: scale -> weight
-                new = "txt_in.norm.weight"
-            else:
-                head = {"1": "txt_in.linear_1.", "3": "txt_in.linear_2."}.get(idx)
-                new = head + key.split(".")[-1] if head else None
-
-        # --- последний слой ---
-        elif key.startswith("last."):
-            rest = key[len("last."):]
-            if rest == "modulation.lin":
-                new = "final_layer.scale_shift_table"
-            elif rest.startswith("norm."):
-                new = "final_layer.norm.weight"
-            elif rest.startswith("linear."):
-                new = "final_layer.linear." + rest.split(".")[-1]
-
-        # --- блоки трансформера ---
-        elif key.startswith("blocks."):
-            m = re.match(r"blocks\.(\d+)\.(.+)$", key)
-            if m:
-                n, rest = m.group(1), m.group(2)
-                if rest == "mod.lin":
-                    new = f"transformer_blocks.{n}.scale_shift_table"
-                else:
-                    inner = _convert_block_inner(rest)
-                    new = f"transformer_blocks.{n}.{inner}" if inner else None
-
-        # --- стадия слияния текста ---
-        elif key.startswith("txtfusion."):
-            rest = key[len("txtfusion."):]
-            if rest.startswith("projector."):
-                new = "text_fusion.projector." + rest.split(".")[-1]
-            else:
-                m = re.match(r"(layerwise_blocks|refiner_blocks)\.(\d+)\.(.+)$", rest)
-                if m:
-                    inner = _convert_block_inner(m.group(3))
-                    new = f"text_fusion.{m.group(1)}.{m.group(2)}.{inner}" if inner else None
-
+        new = comfy_key_to_diffusers(raw_key)
         if new is None:
             unmatched.append(raw_key)
             continue
-
-        # RMSNorm: параметр называется scale в ComfyUI и weight в diffusers
-        if new.endswith(".scale"):
-            new = new[: -len(".scale")] + ".weight"
-
-        # Таблица модуляции блока хранится плоской (6*dim,), diffusers ждёт (6, dim)
-        if new.endswith("scale_shift_table") and value.ndim == 1:
-            value = value.reshape(6, -1)
-
-        out[new] = value
+        out[new] = _fix_value(new, value)
 
     if unmatched and strict:
-        head = "\n  ".join(unmatched[:15])
-        raise ValueError(
-            f"не удалось сопоставить {len(unmatched)} ключей:\n  {head}"
-            + ("\n  ..." if len(unmatched) > 15 else "")
-            + "\n\nЭто не раскладка ComfyUI для Krea 2 — возможно другая архитектура "
-              "или уже diffusers-формат."
-        )
+        _raise_unmatched(unmatched)
     return out
 
 
@@ -172,17 +187,27 @@ def infer_config(sd: dict[str, torch.Tensor]) -> dict:
 
     Надёжнее, чем брать конфиг штатного репозитория: если файнтюн менял глубину
     или ширину, мы это увидим, а не упрёмся в несовпадение форм при загрузке.
+    Хватает форм — значения не читаются, так что годятся и тензоры на meta.
     """
-    n_layers = 1 + max(int(m.group(1))
-                       for k in sd if (m := re.match(r"transformer_blocks\.(\d+)\.", k)))
+    def count(pattern):
+        idx = [int(m.group(1)) for k in sd if (m := re.match(pattern, k))]
+        return 1 + max(idx) if idx else 0
+
+    n_layers = count(r"transformer_blocks\.(\d+)\.")
     hidden = sd["img_in.weight"].shape[0]
     in_ch = sd["img_in.weight"].shape[1]
     inter = sd["transformer_blocks.0.ff.gate.weight"].shape[0]
     text_dim = sd["txt_in.norm.weight"].shape[0]
     n_taps = sd["text_fusion.projector.weight"].shape[1]
-    q = sd["transformer_blocks.0.attn.to_q.weight"].shape[0]
     kv = sd["transformer_blocks.0.attn.to_k.weight"].shape[0]
     head_dim = sd["transformer_blocks.0.attn.norm_q.weight"].shape[0]
+
+    # У text_fusion свои головы и своя ширина MLP: из дефолтов diffusers их брать
+    # нельзя — нештатный энкодер или урезанный фьюжн развалятся на конструкторе.
+    tf = "text_fusion.layerwise_blocks.0"
+    text_head_dim = sd[f"{tf}.attn.norm_q.weight"].shape[0]
+    text_kv = sd[f"{tf}.attn.to_k.weight"].shape[0]
+    text_inter = sd[f"{tf}.ff.gate.weight"].shape[0]
 
     # RoPE-оси из весов не выводятся (у них нет параметров), но модель требует
     # sum(axes_dims_rope) == attention_head_dim и падает на несовпадении. Для штатного
@@ -200,48 +225,83 @@ def infer_config(sd: dict[str, torch.Tensor]) -> dict:
         in_channels=in_ch,
         num_layers=n_layers,
         attention_head_dim=head_dim,
-        num_attention_heads=q // head_dim,
+        num_attention_heads=hidden // head_dim,
         num_key_value_heads=kv // head_dim,
         intermediate_size=inter,
         text_hidden_dim=text_dim,
         num_text_layers=n_taps,
+        text_num_attention_heads=text_dim // text_head_dim,
+        text_num_key_value_heads=text_kv // text_head_dim,
+        text_intermediate_size=text_inter,
+        num_layerwise_text_blocks=count(r"text_fusion\.layerwise_blocks\.(\d+)\."),
+        num_refiner_text_blocks=count(r"text_fusion\.refiner_blocks\.(\d+)\."),
         timestep_embed_dim=sd["time_embed.linear_1.weight"].shape[1],
     )
 
 
 def load_transformer(path: str | Path, dtype=torch.bfloat16, config_overrides: dict | None = None):
-    """Собрать `Krea2Transformer2DModel` из одиночного файла ComfyUI."""
-    from safetensors.torch import load_file
+    """Собрать `Krea2Transformer2DModel` из одиночного файла ComfyUI.
+
+    Про память. Наивный путь — load_file целиком, затем модель в fp32 и
+    load_state_dict — держит одновременно сырые веса, их копию в bf16 и fp32-модель:
+    на 12B это ~85 ГБ RAM. Здесь модель собирается на meta-устройстве, а тензоры
+    читаются из файла по одному, сразу приводятся к целевому типу и встают в модель
+    без копии (assign=True). Пик — примерно размер модели в целевом dtype.
+    """
+    from accelerate import init_empty_weights
+    from safetensors import safe_open
     from diffusers import Krea2Transformer2DModel
 
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"нет файла: {path}")
 
-    raw = load_file(str(path))
-    print(f"[checkpoint] {path.name}: {len(raw)} тензоров")
+    with safe_open(str(path), framework="pt") as f:
+        raw_keys = list(f.keys())
+        print(f"[checkpoint] {path.name}: {len(raw_keys)} тензоров")
 
-    sd = convert_comfy_state_dict(raw)
-    cfg = infer_config(sd)
-    cfg.update(config_overrides or {})
-    print(f"[checkpoint] конфиг из весов: слоёв {cfg['num_layers']}, "
-          f"hidden {cfg['attention_head_dim'] * cfg['num_attention_heads']}, "
-          f"тапов {cfg['num_text_layers']}")
+        names = {k: comfy_key_to_diffusers(k) for k in raw_keys}
+        unmatched = [k for k, v in names.items() if v is None]
+        if unmatched:
+            _raise_unmatched(unmatched)
 
-    # Веса fp8 встречаются у квантованных сборок; трансформер их не примет.
-    sample = next(iter(sd.values()))
-    if sample.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        print(f"[checkpoint] веса в {sample.dtype}, привожу к {dtype}")
-        sd = {k: v.to(dtype) for k, v in sd.items()}
+        # Конфиг — по формам из заголовка, до чтения весов.
+        shapes = {names[k]: _fix_value(names[k], torch.empty(f.get_slice(k).get_shape(),
+                                                              device="meta"))
+                  for k in raw_keys}
+        cfg = infer_config(shapes)
+        cfg.update(config_overrides or {})
+        print(f"[checkpoint] конфиг из весов: слоёв {cfg['num_layers']}, "
+              f"hidden {cfg['attention_head_dim'] * cfg['num_attention_heads']}, "
+              f"тапов {cfg['num_text_layers']}")
 
-    model = Krea2Transformer2DModel(**cfg)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
+        with init_empty_weights():
+            model = Krea2Transformer2DModel(**cfg)
+
+        # Нормы держим в fp32 — ровно так их оставляет from_pretrained
+        # (_keep_in_fp32_modules), иначе файнтюн считался бы не так, как штатный.
+        keep_fp32 = model._keep_in_fp32_modules or []
+        sd, src_dtypes = {}, {}
+        for k in raw_keys:
+            new = names[k]
+            t = f.get_tensor(k)
+            src_dtypes[t.dtype] = src_dtypes.get(t.dtype, 0) + 1
+            want = torch.float32 if any(m in new.split(".") for m in keep_fp32) else dtype
+            sd[new] = _fix_value(new, t.to(want))
+
+    print("[checkpoint] типы в файле: "
+          + ", ".join(f"{str(d).replace('torch.', '')} x{n}" for d, n in src_dtypes.items())
+          + f" -> {str(dtype).replace('torch.', '')} (нормы fp32)")
+
+    missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
     if missing or unexpected:
         raise ValueError(
             f"state_dict не сошёлся: не хватает {len(missing)}, лишних {len(unexpected)}.\n"
             f"  не хватает: {missing[:8]}\n  лишние: {unexpected[:8]}")
 
-    return model.to(dtype)
+    # Метка источника: smoke_test сверяет по ней, что пайплайн собран на этом файле.
+    model._krea2_source = str(path)
+    return model.eval()
 
 
 def guess_distilled(name: str) -> bool | None:
