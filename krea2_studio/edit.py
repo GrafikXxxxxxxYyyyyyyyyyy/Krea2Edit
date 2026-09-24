@@ -22,7 +22,7 @@ from diffusers import Krea2Pipeline
 from diffusers.pipelines.krea2.pipeline_krea2 import calculate_shift, retrieve_timesteps
 
 from .attention import _BiasHolder, build_ref_bias, ref_boost_active
-from .describe import append_pose, describe_pose
+from .describe import append_pose, describe_pose, describe_style, style_prompt
 from .geometry import fit_reference, round_to_multiple
 from .grounding import encode_grounded
 from .lora import edit_lora_active, has_edit_lora
@@ -119,6 +119,9 @@ class Krea2EditPipeline(Krea2Pipeline):
         fit_mode: str = "crop",
         lora_scale: float = 1.0,
         auto_pose: bool = False,
+        init_image: Image.Image | None = None,
+        strength: float = 1.0,
+        style_image: Image.Image | None = None,
         grounding: bool = True,
         grounding_px: int = 768,
         system_prompt: str | None = None,
@@ -130,9 +133,25 @@ class Krea2EditPipeline(Krea2Pipeline):
 
         images: порядок обучения — сначала сцена, затем субъект. Последний считается
         основным, на него действует ref_boost (остальным достаётся ref_boost_scene).
+
+        init_image/strength: img2img — генерация стартует не с чистого шума, а с
+        зашумлённого латента init_image. strength=1.0 — обычный режим (картинка не
+        используется), 0.5 — пропустить первую половину расписания: композиция, поза и
+        фон берутся из init_image почти жёстко, а меняется то, что задано инструкцией
+        (например, стиль). init_image подгоняется под height×width обрезкой по центру.
+
+        style_image: перенос стиля. Стиль снимается с картинки словами (describe_style)
+        и превращается в инструкцию «перерисуй в этом стиле»; prompt, если задан,
+        дописывается следом. В последовательность style_image НЕ попадает: как
+        референс он переносил бы содержимое (объекты, фон, позу), а не манеру.
+        Проверенный рецепт: images=[исходник], init_image=исходник, strength≈0.9,
+        ref_boost≈0.35 — ослабленный референс даёт стилю проявиться, а старт
+        с исходника держит позу, фон и цвета.
         """
-        if not images:
-            raise ValueError("edit() требует хотя бы один референс; для t2i зови сам пайплайн")
+        images = list(images or [])
+        if not images and init_image is None:
+            raise ValueError("edit() требует хотя бы один референс или init_image; "
+                             "для t2i зови сам пайплайн")
 
         # Поза из референса сцены сама не переносится (см. describe.py) — снимаем её
         # словами с самой картинки и дописываем в инструкцию. Имеет смысл только при
@@ -143,6 +162,13 @@ class Krea2EditPipeline(Krea2Pipeline):
                 raise ValueError("auto_pose=True требует processor (AutoProcessor Qwen3-VL)")
             self.last_pose_description = describe_pose(self, images[0], processor)
             prompt = append_pose(prompt, self.last_pose_description)
+
+        self.last_style_description = None
+        if style_image is not None:
+            if processor is None:
+                raise ValueError("style_image требует processor (AutoProcessor Qwen3-VL)")
+            self.last_style_description = describe_style(self, style_image, processor)
+            prompt = style_prompt(self.last_style_description, prompt)
 
         # Дефолты зависят от чекпоинта: Turbo (TDM) дистиллирован под few-step БЕЗ CFG,
         # Raw — под 28 шагов с guidance 4.5. Жёсткие значения здесь означали бы, что
@@ -171,7 +197,7 @@ class Krea2EditPipeline(Krea2Pipeline):
         do_cfg = guidance_scale > 0
 
         # --- 1. условие ---
-        if grounding:
+        if grounding and images:
             if processor is None:
                 raise ValueError("grounding=True требует processor (AutoProcessor Qwen3-VL)")
             prompt_embeds, prompt_mask = encode_grounded(
@@ -232,14 +258,29 @@ class Krea2EditPipeline(Krea2Pipeline):
         )
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu)
-        self.scheduler.set_begin_index(0)
+        start = 0
+        if init_image is not None and strength < 1.0:
+            # img2img: flow matching зашумляет линейно, x_t = (1-σ)·x0 + σ·шум, так что
+            # старт с шага `start` — это ровно та точка траектории, куда шум
+            # из prepare_latents привёл бы чистую init_image.
+            start = min(int(round(num_inference_steps * (1.0 - strength))),
+                        num_inference_steps - 1)
+            x0, _ = self.encode_reference(init_image, height, width, mode="crop",
+                                          dtype=self.vae.dtype)
+            x0 = x0.to(latents.dtype).expand(latents.shape[0], -1, -1)
+            sigma = self.scheduler.sigmas[start].to(latents.device, latents.dtype)
+            latents = (1.0 - sigma) * x0 + sigma * latents
+            timesteps = timesteps[start:]
+        self.scheduler.set_begin_index(start)
 
         # --- 5. опциональный ref_boost ---
         ref_lens = [r.shape[1] for r in refs_packed]
-        boosts = [ref_boost_scene] * (len(refs_packed) - 1) + [ref_boost]
+        # Без референсов (чистый img2img) бустить нечего.
+        boosts = ([ref_boost_scene] * (len(refs_packed) - 1) + [ref_boost]) if refs_packed else []
         bias = build_ref_bias(
             prompt_embeds.shape[1], ref_lens, latents.shape[1], boosts,
-            text_mask=prompt_mask, masks=[None] * (len(refs_packed) - 1) + [boost_mask],
+            text_mask=prompt_mask,
+            masks=([None] * (len(refs_packed) - 1) + [boost_mask]) if refs_packed else [],
             ref_grids=[(s[0], s[1]) for s in ref_specs],
             device=device, dtype=self.transformer.dtype,
         )
@@ -248,7 +289,7 @@ class Krea2EditPipeline(Krea2Pipeline):
         # --- 6. денойзинг ---
         def run_loop():
             nonlocal latents
-            with self.progress_bar(total=num_inference_steps) as bar:
+            with self.progress_bar(total=len(timesteps)) as bar:
                 for t in timesteps:
                     ts = (t / self.scheduler.config.num_train_timesteps).expand(
                         latents.shape[0]).to(latents.dtype)
@@ -266,7 +307,7 @@ class Krea2EditPipeline(Krea2Pipeline):
         # Базовые веса Krea 2 — text2image: они копируют референс и не исполняют
         # инструкцию. Навык edit приносит LoRA (см. lora.py); без неё режим
         # технически работает, но редактированием не является.
-        if not has_edit_lora(self):
+        if refs_packed and not has_edit_lora(self):
             warnings.warn(
                 "edit-LoRA не загружена: базовый Krea 2 скопирует референс и "
                 "проигнорирует инструкцию. Загрузи её через "

@@ -8,7 +8,8 @@ Krea 2), а geometry/attention полезны и без него — напри�
 from .attention import build_ref_bias
 from .checkpoint import (comfy_key_to_diffusers, convert_comfy_state_dict, guess_distilled,
                          infer_config, load_transformer)
-from .describe import POSE_QUESTION, append_pose, describe_pose
+from .describe import (POSE_QUESTION, STYLE_QUESTION, append_pose, describe_pose,
+                       describe_style, style_prompt)
 from .encoder import DEFAULT_ENCODER, check_compat, encoder_drift, load_text_encoder
 from .geometry import fit_reference, round_to_multiple, PIXELS_PER_TOKEN
 from .grounding import DEFAULT_GROUNDING_PX, DEFAULT_SYSTEM_PROMPT
@@ -20,6 +21,7 @@ __all__ = [
     "DEFAULT_SYSTEM_PROMPT", "DEFAULT_GROUNDING_PX",
     "load_edit_lora", "has_edit_lora", "DEFAULT_LORA_REPO", "DEFAULT_LORA_FILE",
     "describe_pose", "append_pose", "POSE_QUESTION",
+    "describe_style", "style_prompt", "STYLE_QUESTION",
     "load_text_encoder", "check_compat", "encoder_drift", "DEFAULT_ENCODER",
     "load_transformer", "convert_comfy_state_dict", "comfy_key_to_diffusers",
     "infer_config", "guess_distilled", "load_pipeline",

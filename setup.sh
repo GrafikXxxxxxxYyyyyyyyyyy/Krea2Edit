@@ -84,7 +84,7 @@ echo "python: $(command -v python) ($(python --version 2>&1))"
 
 mkdir -p "$KREA2_MODELS_DIR" "$HF_HOME"
 FREE_GB=$(df -Pk "$KREA2_MODELS_DIR" | awk 'NR==2 {print int($4/1024/1024)}')
-echo "свободно на диске: ${FREE_GB} ГБ (нужно ~25 ГБ при первой установке)"
+echo "свободно на диске: ${FREE_GB} ГБ (нужно ~50 ГБ при первой установке)"
 
 # ---------- 2. зависимости ----------
 say "2/6 зависимости"
@@ -248,11 +248,11 @@ model = os.environ["KREA2_MODEL"]
 encoder = os.environ.get("KREA2_TEXT_ENCODER", "")
 transformer = os.environ.get("KREA2_TRANSFORMER", "")
 
-# Из репозитория модели берём только то, что не подменяем: свой трансформер и
-# свой энкодер from_pretrained качать не станет, и нам не нужно (−33 ГБ).
-patterns = ["model_index.json", "scheduler/*", "tokenizer/*", "vae/*"]
-if not transformer:
-    patterns.append("transformer/*")
+# Из репозитория модели берём только то, что нужно. Штатный трансформер — всегда:
+# даже при своём (DAF-K2T) на нём идёт режим «Стиль» (фотореалистичный файнтюн
+# тянет стиль к фото), веса подменяются на месте — см. krea2_studio/swap.py.
+# Штатный энкодер при своём не нужен (−8 ГБ).
+patterns = ["model_index.json", "scheduler/*", "tokenizer/*", "vae/*", "transformer/*"]
 if not encoder:
     patterns.append("text_encoder/*")
 snapshot_download(model, allow_patterns=patterns)

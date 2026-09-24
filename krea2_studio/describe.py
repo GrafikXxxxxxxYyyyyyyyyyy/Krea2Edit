@@ -45,10 +45,30 @@ def _captioner(pipe):
     return lm
 
 
+# Стиль — зеркальная задача: только КАК нарисовано, ни слова о том, ЧТО нарисовано.
+# Иначе в инструкцию просочатся объекты и персонажи референса стиля, и модель начнёт
+# переносить содержимое, а не манеру.
+STYLE_QUESTION = (
+    "Describe ONLY the visual art style of this image so that another picture could be "
+    "redrawn in exactly the same style. Start with the genre and medium in a few words "
+    "(for example: anime illustration, watercolor painting, oil painting, 3D render, "
+    "comic book art, pixel art, film photograph). Then describe the line work, shading and "
+    "coloring method, color palette, lighting and level of detail. Do NOT mention any "
+    "people, characters, objects, clothing, poses or background contents. Two sentences."
+)
+
+
+@torch.no_grad()
+def describe_style(pipe, image: Image.Image, processor, max_new_tokens: int = 120) -> str:
+    """Описание художественного стиля картинки без её содержимого."""
+    return describe_pose(pipe, image, processor, question=STYLE_QUESTION,
+                         max_new_tokens=max_new_tokens)
+
+
 @torch.no_grad()
 def describe_pose(pipe, image: Image.Image, processor,
                   question: str = POSE_QUESTION, max_new_tokens: int = 90) -> str:
-    """Одно предложение про позу человека на картинке."""
+    """Одно предложение про позу человека на картинке (или ответ на свой question)."""
     lm = _captioner(pipe)
     messages = [{"role": "user", "content": [
         {"type": "image", "image": image.convert("RGB")},
@@ -66,6 +86,22 @@ def describe_pose(pipe, image: Image.Image, processor,
     text = processor.batch_decode(
         ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
     return text.strip()
+
+
+# Инструкция для переноса стиля. Проверено на паре «фото -> аниме»: просьба сохранить
+# цвета сама по себе фон не спасает (палитра стиля перекрашивает его), держит цвета
+# старт с зашумлённой исходной картинки (init_image) — см. Krea2EditPipeline.edit.
+STYLE_INSTRUCTION = (
+    "Redraw this exact image as {style} Keep the same person, pose, clothing, composition, "
+    "framing and background exactly unchanged, and keep the original colors of the "
+    "background, skin, hair and clothing; change only the rendering style."
+)
+
+
+def style_prompt(style: str, prompt: str = "") -> str:
+    """Инструкция «перерисуй в этом стиле» + необязательные пожелания пользователя."""
+    base = STYLE_INSTRUCTION.format(style=style.strip())
+    return f"{base} {prompt.strip()}" if prompt and prompt.strip() else base
 
 
 def append_pose(prompt: str, pose: str) -> str:
